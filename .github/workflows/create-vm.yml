@@ -1,0 +1,86 @@
+name: Try to Create OCI VM
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+env:
+  COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+  IMAGE_ID: ${{ secrets.IMAGE_ID }}
+  SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+  AD_NAME: ${{ secrets.AD_NAME }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  INSTANCE_NAME: vpn-a1-free
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache pip packages
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: ${{ runner.os }}-pip-oci-cli-v1
+
+      - name: Add OCI CLI to path
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Setup OCI CLI and Try to Create VM
+        id: create_vm
+        run: |
+          set -o pipefail
+
+          pip install oci-cli
+
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          echo "[DEFAULT]" > ~/.oci/config
+          echo "user=${{ secrets.OCI_CLI_USER }}" >> ~/.oci/config
+          echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> ~/.oci/config
+          echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> ~/.oci/config
+          echo "key_file=~/.oci/oci_api_key.pem" >> ~/.oci/config
+          echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
+
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$INSTANCE_NAME" \
+            --all \
+            --query 'length(data[?"lifecycle-state" != `TERMINATED`])' \
+            --raw-output)
+
+          if [ "$EXISTING" != "0" ]; then
+            OCI_OUTPUT="Instance $INSTANCE_NAME already exists and is RUNNING. Nothing to create."
+          else
+            OCI_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+              --assign-public-ip true \
+              --display-name "$INSTANCE_NAME" \
+              --boot-volume-size-in-gbs 50 2>&1 || true)
+          fi
+
+          # Store the log as a GitHub step output
+          echo "log_data<<EOF" >> $GITHUB_OUTPUT
+          echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Treat a new provisioning instance or an already-existing instance as success.
+          if echo "$OCI_OUTPUT" | grep -Eq '"lifecycle-state": "PROVISIONING"|already exists and is RUNNING'; then
+            echo "Success or existing instance found."
+            exit 0
+          else
+            echo "Error: Success string not found in OCI output. Failing the step."
+            exit 1
+          fi
